@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"flag"
 	"fmt"
 	"log"
@@ -11,7 +10,7 @@ import (
 	"sync"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/gocolly/colly"
+	"github.com/gocolly/colly/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -28,7 +27,7 @@ var (
 
 // Exporter represents an instance of the Netgear cable modem exporter.
 type Exporter struct {
-	url, authHeaderValue string
+	url, username, password string
 
 	mu sync.Mutex
 
@@ -47,13 +46,6 @@ type Exporter struct {
 	usChannelSymbolRate *prometheus.Desc
 }
 
-// basicAuth returns the base64 encoding of the username and password
-// separated by a colon. Borrowed the net/http package.
-func basicAuth(username, password string) string {
-	auth := fmt.Sprintf("%s:%s", username, password)
-	return base64.StdEncoding.EncodeToString([]byte(auth))
-}
-
 // NewExporter returns an instance of Exporter configured with the modem's
 // address, admin username and password.
 func NewExporter(addr, username, password string) *Exporter {
@@ -64,8 +56,9 @@ func NewExporter(addr, username, password string) *Exporter {
 
 	return &Exporter{
 		// Modem access details.
-		url:             "http://" + addr + "/DocsisStatus.asp",
-		authHeaderValue: "Basic " + basicAuth(username, password),
+		url:      "http://" + addr + "/DocsisStatus.asp",
+		username: username,
+		password: password,
 
 		// Collection metrics.
 		totalScrapes: prometheus.NewCounter(prometheus.CounterOpts{
@@ -136,11 +129,6 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 
 	c := colly.NewCollector()
 
-	// OnRequest callback adds basic auth header.
-	c.OnRequest(func(r *colly.Request) {
-		r.Headers.Add("Authorization", e.authHeaderValue)
-	})
-
 	// OnError callback counts any errors that occur during scraping.
 	c.OnError(func(r *colly.Response, err error) {
 		log.Printf("scrape failed: %d %s", r.StatusCode, http.StatusText(r.StatusCode))
@@ -161,6 +149,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 				freqMHz    string
 				snr        float64
 				power      float64
+				codewords  float64
 				corrErrs   float64
 				unCorrErrs float64
 			)
@@ -187,8 +176,10 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 				case 6:
 					fmt.Sscanf(text, "%f dB", &snr)
 				case 7:
-					fmt.Sscanf(text, "%f", &corrErrs)
+					fmt.Sscanf(text, "%f", &codewords)
 				case 8:
+					fmt.Sscanf(text, "%f", &corrErrs)
+				case 9:
 					fmt.Sscanf(text, "%f", &unCorrErrs)
 				}
 			})
@@ -212,7 +203,6 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 				lockStatus  string
 				channelType string
 				channelID   string
-				symbolRate  float64
 				freqMHz     string
 				power       float64
 			)
@@ -229,28 +219,40 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 					channelID = text
 				case 4:
 					{
-						fmt.Sscanf(text, "%f Ksym/sec", &symbolRate)
-						symbolRate = symbolRate * 1000 // convert to sym/sec
-					}
-				case 5:
-					{
 						var freqHZ float64
 						fmt.Sscanf(text, "%f Hz", &freqHZ)
 						freqMHz = fmt.Sprintf("%0.2f MHz", freqHZ/1e6)
 					}
-				case 6:
+				case 5:
 					fmt.Sscanf(text, "%f dBmV", &power)
 				}
 			})
 			labels := []string{channel, lockStatus, channelType, channelID, freqMHz}
 
 			ch <- prometheus.MustNewConstMetric(e.usChannelPower, prometheus.GaugeValue, power, labels...)
-			ch <- prometheus.MustNewConstMetric(e.usChannelSymbolRate, prometheus.GaugeValue, symbolRate, labels...)
 		})
 	})
 
+	c.OnHTML("input[name=webToken]", func(el *colly.HTMLElement) {
+		webToken := el.Attr("value")
+		form := map[string]string{
+			"loginUsername": e.username,
+			"loginPassword": e.password,
+			"webToken":      webToken,
+		}
+		err := c.Post("http://192.168.100.1/goform/GenieLogin", form)
+		if err != nil {
+			log.Printf("Error logging in %s", err)
+		}
+		c.Visit(e.url)
+	})
+
+	c.OnError(func(r *colly.Response, err error) {
+		log.Printf("login failed: %d %s", r.StatusCode, http.StatusText(r.StatusCode))
+	})
+
 	e.mu.Lock()
-	c.Visit(e.url)
+	c.Visit("http://192.168.100.1/GenieLogin.asp")
 	e.totalScrapes.Collect(ch)
 	e.scrapeErrors.Collect(ch)
 	e.mu.Unlock()
